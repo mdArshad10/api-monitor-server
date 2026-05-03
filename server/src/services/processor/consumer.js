@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { RetryStrategy } from "../../shared/events/producers/RetryStrategy";
 
 const messageSchema = z.object({
   type: z.enum([EVENT_TYPES.API_HIT]),
@@ -56,7 +57,24 @@ class EventConsumer {
         this._logger.warn("Consumer channel closed unexpectedly");
         if (this.isRunning) this._reconnect();
       });
-    } catch (error) {}
+
+      this._logger.info(
+        `Started consuming from queue ${this._config.rabbitMQ.queue}`,
+      );
+      this.isRunning = true;
+
+      await this.channel.consume(
+        this._config.rabbitMQ.queue,
+        async (msg) => {
+          if (msg !== null) await this._handleMessage(msg);
+        },
+        { noAck: false, consumerTag: `consumer-${Date.now()}` },
+      );
+      this._logger.info("Event consumer is running");
+    } catch (error) {
+      this._logger.error("Failed to Start consumer", error);
+      await this._cleanup();
+    }
   }
 
   async _connectDatabase() {
@@ -128,10 +146,52 @@ class EventConsumer {
     let messageDate = null;
     try {
       messageDate = this._parseMessage(msg);
+
+      // for idom
+      if (this._processedIds.has(messageDate.messageId)) {
+        this._logger.debug("Duplicate message skipped", {
+          messageId: messageDate.messageId,
+        });
+        this.channel.ack(msg);
+        return;
+      }
+
+      await this._processData(messageDate);
+      this.channel.ack(msg);
+      this._circuitBreaker.onSuccess();
+      this.stats.processed++;
+      this.stats.lastProcessedAt = new Date();
+
+      this._processedIds.add(messageDate.messageId);
+      // if size of processedIds is greater than that then we remove it
+      if (this._processedIds.size > 100_00) {
+        const first = this._processedIds.values().next().value;
+        this._processedIds.delete(first);
+      }
+
+      this._poisonMessages.delete(messageDate.type);
+    } catch (error) {
+      await this._handleProcessingError(error, msg, messageDate, startTime);
+    }
+  }
+
+  async _processData(messageData) {
+    try {
+      switch (messageData.type) {
+        case EVENT_TYPES.API_HIT:
+          await this._processorService.processEvent(messageData.data);
+          break;
+
+        default:
+          throw new Error(`Unknown event type: ${messageData.type}`);
+          break;
+      }
     } catch (error) {}
   }
 
-  async _parseMessage(msg) {
+  async _handleProcessingError(error, msg, messageDate, startTime) {}
+
+  _parseMessage(msg) {
     try {
       const content = msg.content.toString();
       const messageData = JSON.parse(content);
@@ -151,6 +211,57 @@ class EventConsumer {
       throw new Error(`Message parsing failed: ${error.message}`);
     }
   }
+
+  async _cleanup() {
+    try {
+      this.isRunning = false;
+      if (this.channel) {
+        await this.channel.close();
+        this.channel = null;
+      }
+    } catch (error) {
+      this._logger.error(`Error during cleanup:`, error);
+    }
+  }
 }
+
+const consumer = new EventConsumer({
+  processorService: processorContainer.services.processorService,
+  rabbitmq,
+  mongodb,
+  postgres,
+  config,
+  logger,
+  retryStrategy,
+  circuitBreaker,
+});
+
+export const startConsumerWithRetry = () => {
+  try {
+    const setupRetry = new RetryStrategy({
+      maxRetries: 5,
+      baseDelayMs: 5000,
+      maxDelayMs: 30_000,
+    });
+    let attempt = 0;
+    while (setupRetry.shouldRetry(attempt) || attempt == 0) {
+      try {
+        logger.info(`Starting Consumer (attempt ${attempt + 1})`);
+        await consumer.start();
+        logger.info('Consumer started successfully');
+        return;
+      } catch (error) {
+        attempt ++;
+        logger.error(`Consumer start attempt ${attempt} failed:`, error);
+        if(!setupRetry.shouldRetry(attempt)){
+          logger.error('Max retries reached, exiting...');
+          process.exit(1);
+        }
+
+        await setupRetry.wait(attempt-1);
+      }
+    }
+  } catch (error) {}
+};
 
 export { EventConsumer };
