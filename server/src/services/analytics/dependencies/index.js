@@ -1,9 +1,14 @@
 import {MetricsRepository} from '../../processor/repository/metricsRepository.js'
+import { AnalyticService } from '../services/analytic.service.js';
 
 class Container {
   static init() {
-    const controllers = {};
-    const services = new MetricsRepository();
+    const services = {
+      analyticsService: new AnalyticService(),
+    };
+    const controllers = {
+      
+    };
     return { services, controllers };
   }
 }
