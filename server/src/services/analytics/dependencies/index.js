@@ -1,7 +1,9 @@
+import {MetricsRepository} from '../../processor/repository/metricsRepository.js'
+
 class Container {
   static init() {
-    const services = {};
     const controllers = {};
+    const services = new MetricsRepository();
     return { services, controllers };
   }
 }
